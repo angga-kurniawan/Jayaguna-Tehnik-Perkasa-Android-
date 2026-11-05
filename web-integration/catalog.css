@@ -1,0 +1,25 @@
+.jt-catalog { --jt-ink: #153c42; --jt-muted: #546b70; --jt-line: #dce6e8; color: var(--jt-ink); font-family: system-ui, sans-serif; }
+.jt-catalog *, .jt-catalog *::before, .jt-catalog *::after { box-sizing: border-box; }
+.jt-catalog [hidden] { display: none !important; }
+.jt-catalog .jt-product-grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(min(100%,260px),1fr)); gap: 20px; }
+.jt-catalog .jt-product-card { border: 1px solid var(--jt-line); border-radius: 18px; overflow: hidden; background: #fff; }
+.jt-catalog .jt-image-frame { aspect-ratio: 4 / 3; display: grid; place-items: center; background: #f6f9fa; overflow: hidden; }
+.jt-catalog .jt-product-image { width: 100%; height: 100%; object-fit: contain; padding: 12px; }
+.jt-catalog .jt-product-body { padding: 20px; }
+.jt-catalog .jt-product-brand { margin: 0 0 6px; color: #087e87; font-size: .8rem; text-transform: uppercase; letter-spacing: .08em; }
+.jt-catalog .jt-product-name { margin: 0; font-size: 1.15rem; line-height: 1.4; }
+.jt-catalog .jt-product-details, .jt-catalog .jt-product-description { color: var(--jt-muted); font-size: .9rem; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
+.jt-catalog .jt-product-price { font-weight: 700; }
+.jt-catalog .jt-product-specifications { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 6px 12px; font-size: .85rem; overflow-wrap: anywhere; }
+.jt-catalog .jt-product-specifications dt { color: var(--jt-muted); }
+.jt-catalog .jt-product-specifications dd { margin: 0; }
+.jt-catalog .jt-partner-grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(min(100%,150px),1fr)); gap: 20px; }
+.jt-catalog .jt-partner-card { border: 1px solid var(--jt-line); border-radius: 12px; padding: 16px; text-align: center; background: #fff; }
+.jt-catalog .jt-partner-card .jt-image-frame { aspect-ratio: 3 / 2; background: transparent; }
+.jt-catalog .jt-partner-logo { width: 100%; height: 100%; object-fit: contain; }
+.jt-catalog .jt-partner-name { display: block; color: var(--jt-ink); font-size: .9rem; margin: 12px 0 0; overflow-wrap: anywhere; }
+.jt-catalog .jt-image-fallback { font-size: .8rem; color: var(--jt-muted); padding: 12px; text-align: center; }
+.jt-catalog .jt-catalog-message { color: var(--jt-muted); }
+.jt-catalog .jt-catalog-more, .jt-catalog .jt-catalog-retry { border: 1px solid #087e87; border-radius: 100px; padding: 12px 24px; margin: 24px auto; display: block; font: inherit; color: #07656d; background: #fff; cursor: pointer; }
+.jt-catalog button:focus-visible, .jt-catalog a:focus-visible { outline: 3px solid #e69228; outline-offset: 4px; }
+.jt-catalog button:disabled { opacity: .5; cursor: progress; }

@@ -1,0 +1,45 @@
+{
+  "name": "jayaguna-admin-functions",
+  "private": true,
+  "version": "1.0.0",
+  "main": "lib/index.js",
+  "engines": {
+    "node": "22"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start:api": "node --env-file=.env lib/server.js",
+    "start:admin": "node lib/admin-server.js",
+    "configure:drive": "node scripts/configure-drive.cjs",
+    "connect:company-drive": "node --env-file=.env scripts/connect-company-drive.cjs",
+    "configure:firebase": "node scripts/configure-firebase.cjs",
+    "configure:apps-script": "node --env-file=.env scripts/configure-apps-script.cjs",
+    "apps-script:api": "node scripts/apps-script-api.cjs",
+    "apps-script:admin": "node scripts/apps-script-admin.cjs",
+    "check:backend": "node --env-file=.env scripts/check-backend.cjs",
+    "owner:activate": "node --env-file=.env scripts/activate-owner.cjs",
+    "test": "npm run build && node --test test/unit.test.mjs test/emulator-environment.test.mjs test/drive.test.mjs test/debug-device-registration.test.mjs test/server-config.test.mjs test/admin-server.test.mjs test/apps-script-config.test.mjs test/apps-script-admin.test.mjs test/approved-access.test.mjs test/access-request.test.mjs test/central-server.test.mjs test/central-drive.test.mjs test/connect-company-drive.test.mjs",
+    "test:emulator": "npm run build && node --test --test-concurrency=1 test/emulator.test.mjs test/drive-emulator.test.mjs test/native-catalog-rules.test.mjs test/portfolio-rules.test.mjs test/access-rules.test.mjs",
+    "bootstrap": "node scripts/bootstrap-owner.mjs",
+    "bootstrap:cli": "node scripts/bootstrap-owner-cli.cjs",
+    "project:status": "node scripts/project-status.cjs",
+    "appcheck:device": "node scripts/register-debug-device.cjs",
+    "appcheck:api": "node scripts/appcheck-api.cjs",
+    "seed:emulator": "npm run build && node scripts/seed-emulator.mjs",
+    "verify:emulator": "node scripts/verify-emulator.mjs",
+    "start:central": "node lib/central-server.js"
+  },
+  "dependencies": {
+    "firebase-admin": "13.5.0",
+    "firebase-functions": "6.4.0",
+    "google-auth-library": "9.15.1",
+    "sharp": "0.35.5",
+    "zod": "3.25.76"
+  },
+  "devDependencies": {
+    "@firebase/rules-unit-testing": "4.0.1",
+    "@types/node": "22.15.30",
+    "firebase": "11.10.0",
+    "typescript": "5.8.3"
+  }
+}

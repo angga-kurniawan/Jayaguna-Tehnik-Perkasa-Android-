@@ -1,0 +1,72 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    function googleUser() {
+      return request.auth!=null && request.auth.token.get('email_verified',false)==true
+        && request.auth.token.get('email','') is string && request.auth.token.email.size()>3
+        && request.auth.token.email.size()<=320 && !request.auth.token.email.matches('.*[/].*')
+        && request.auth.token.get('firebase',{}).get('sign_in_provider','')=='google.com';
+    }
+    function authEmail() { return request.auth.token.get('email','').lower(); }
+    function uidProfile() {
+      return request.auth!=null && firestore.exists(/databases/(default)/documents/users/$(request.auth.uid))
+        ? firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data : {};
+    }
+    function emailGrant() {
+      return googleUser() && firestore.exists(/databases/(default)/documents/accessGrants/$(authEmail()))
+        ? firestore.get(/databases/(default)/documents/accessGrants/$(authEmail())).data : {};
+    }
+    function fresh(p) {
+      return p.get('revokedBeforeSeconds',0)==0
+        || request.auth.token.get('auth_time',0)>p.revokedBeforeSeconds;
+    }
+    function legacyStaff(p) {
+      return request.auth!=null && !p.keys().hasAny(['status'])
+        && request.auth.token.get('role','') in ['OWNER','ADMIN'] && p.get('active',false)==true
+        && p.get('role','')==request.auth.token.role && fresh(p);
+    }
+    function approved(p) {
+      return googleUser() && p.get('status','')=='approved' && p.get('active',true)==true
+        && p.get('role','ADMIN') in ['OWNER','ADMIN'] && p.get('uid',request.auth.uid)==request.auth.uid
+        && p.get('email',authEmail()) is string && p.get('email',authEmail()).lower()==authEmail()
+        && request.auth.token.get('auth_time',0) is int && request.auth.token.auth_time>0 && fresh(p);
+    }
+    function staff() {
+      let p=uidProfile();
+      return request.auth!=null && p.get('active',true)==true && fresh(p)
+        && (p.keys().hasAny(['status']) ? approved(p) : legacyStaff(p) || approved(emailGrant()));
+    }
+    function validUpload(uid, uploadId, fileName) {
+      let session = firestore.get(/databases/(default)/documents/uploadSessions/$(uid + '_' + uploadId)).data;
+      return session.uid == uid && session.expiresAt > request.time
+        && session.storagePath == 'staging/' + uid + '/' + uploadId + '/' + fileName
+        && request.resource.size == session.bytes && request.resource.contentType == session.contentType;
+    }
+    function publicProduct(id, path) {
+      let doc = firestore.get(/databases/(default)/documents/publicProducts/$(id)).data;
+      return firestore.exists(/databases/(default)/documents/publicProducts/$(id))
+        && doc.status == 'active' && doc.archived == false && path in doc.mediaPaths;
+    }
+    function publicPartner(id, path) {
+      let doc = firestore.get(/databases/(default)/documents/publicPartners/$(id)).data;
+      return firestore.exists(/databases/(default)/documents/publicPartners/$(id))
+        && doc.active == true && doc.archived == false && path in doc.mediaPaths;
+    }
+    match /staging/{uid}/{uploadId}/{fileName} {
+      allow get: if request.auth != null && request.auth.uid == uid && staff();
+      allow create: if request.auth != null && request.auth.uid == uid && staff()
+        && resource == null
+        && fileName.matches('image[.](png|jpeg|webp)')
+        && request.resource.size > 0 && request.resource.size <= 5 * 1024 * 1024
+        && request.resource.contentType in ['image/png','image/jpeg','image/webp']
+        && validUpload(uid, uploadId, fileName);
+    }
+    match /media/product/{id}/{fileName} {
+      allow get: if publicProduct(id, 'media/product/' + id + '/' + fileName) || staff();
+    }
+    match /media/partner/{id}/{fileName} {
+      allow get: if publicPartner(id, 'media/partner/' + id + '/' + fileName) || staff();
+    }
+    match /{allPaths=**} { allow read, write: if false; }
+  }
+}

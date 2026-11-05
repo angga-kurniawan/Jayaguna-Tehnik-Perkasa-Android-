@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="id">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Katalog AC · Jayaguna Tehnik Perkasa</title>
+    <link rel="stylesheet" href="./catalog.css" />
+    <style>
+      body { margin: 0; background: #f7fafb; color: #153c42; font-family: system-ui,sans-serif; }
+      main { max-width: 1180px; margin: auto; padding: 40px 20px; }
+      header { padding: 28px 0; }
+      header p { color: #546b70; line-height: 1.7; }
+      h1 { font-size: clamp(2rem,6vw,3.5rem); letter-spacing: -.04em; margin: 8px 0; }
+      section { margin: 40px 0; }
+      #configuration-status { padding: 16px; background: #fff4da; border-radius: 12px; }
+    </style>
+  </head>
+  <body>
+    <!-- Standalone integration example. Mount the two sections in your existing
+         website instead of replacing its established design. -->
+    <main>
+      <header><p>JAYAGUNA TEHNIK PERKASA</p><h1>Solusi udara untuk setiap ruang.</h1><p>Produk AC dan perusahaan yang telah bekerja sama dengan kami.</p></header>
+      <p id="configuration-status" role="alert" hidden></p>
+      <section class="jt-catalog" aria-labelledby="products-heading"><h2 id="products-heading">Produk AC</h2><div id="jt-products"></div></section>
+      <section class="jt-catalog" aria-labelledby="partners-heading"><h2 id="partners-heading">Mitra kami</h2><div id="jt-partners"></div></section>
+    </main>
+    <script type="module" src="./demo.js"></script>
+  </body>
+</html>

@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Proportional padding preserves the original logo inside adaptive icon masks. -->
+<inset xmlns:android="http://schemas.android.com/apk/res/android"
+    android:insetLeft="20.37%" android:insetRight="20.37%"
+    android:insetTop="26.52%" android:insetBottom="26.52%">
+    <bitmap android:src="@drawable/jayaguna_logo" android:gravity="fill"
+        android:filter="true" android:antialias="true" />
+</inset>

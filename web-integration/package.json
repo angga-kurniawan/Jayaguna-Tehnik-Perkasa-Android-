@@ -1,0 +1,12 @@
+{
+  "name": "jayaguna-public-catalog",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "check": "node --check catalog.js && node --check firebase-client.js && node --check demo.js && node --check helpers.js",
+    "dev": "node dev-server.js"
+  },
+  "engines": { "node": ">=22" }
+}

@@ -1,0 +1,445 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function googleUser() {
+      return request.auth!=null && request.auth.token.get('email_verified',false)==true
+        && request.auth.token.get('email','') is string && request.auth.token.email.size()>3
+        && request.auth.token.email.size()<=320 && !request.auth.token.email.matches('.*[/].*')
+        && request.auth.token.get('firebase',{}).get('sign_in_provider','')=='google.com';
+    }
+    function authEmail() { return request.auth.token.get('email','').lower(); }
+    function uidProfile() {
+      return request.auth!=null && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        ? get(/databases/$(database)/documents/users/$(request.auth.uid)).data : {};
+    }
+    function emailGrant() {
+      // Loading a candidate grants no permission: approved() verifies its Google
+      // identity before use. Avoid validating that identity twice per write.
+      return request.auth!=null && exists(/databases/$(database)/documents/accessGrants/$(authEmail()))
+        ? get(/databases/$(database)/documents/accessGrants/$(authEmail())).data : {};
+    }
+    function fresh(p) {
+      return p.get('revokedBeforeSeconds',0)==0
+        || request.auth.token.get('auth_time',0)>p.revokedBeforeSeconds;
+    }
+    function legacyStaff(p) {
+      return request.auth!=null && !('status' in p)
+        && request.auth.token.get('role','') in ['OWNER','ADMIN'] && p.get('active',false)==true
+        && p.get('role','')==request.auth.token.role && fresh(p);
+    }
+    function sameIdentity(p) {
+      return p.get('uid',request.auth.uid)==request.auth.uid
+        && p.get('email',authEmail()) is string && p.get('email',authEmail()).lower()==authEmail();
+    }
+    function approved(p) {
+      return googleUser() && p.get('status','')=='approved' && p.get('active',true)==true
+        && p.get('role','ADMIN') in ['OWNER','ADMIN'] && sameIdentity(p)
+        && request.auth.token.get('auth_time',0) is int && request.auth.token.auth_time>0 && fresh(p);
+    }
+    function access() {
+      let uid=uidProfile();
+      let legacy=legacyStaff(uid);
+      let selected=('status' in uid) || legacy ? uid : emailGrant();
+      // An explicit UID decision wins. Valid legacy identities retain their
+      // audit identity. UID disable/revocation also vetoes any email grant.
+      return {'profile':selected,'allowed':request.auth!=null
+        && (uid=={} || uid.get('active',true)==true && fresh(uid))
+        && (legacy || approved(selected))};
+    }
+    function staff() { return access().allowed; }
+    function profile() {
+      let uid=uidProfile();
+      return ('status' in uid) || legacyStaff(uid) ? uid : emailGrant();
+    }
+    function actorRole() { return profile().get('role','ADMIN'); }
+    function nonblank(v) { return v is string && v.matches('[\\s\\S]*\\S[\\s\\S]*'); }
+    function actorName(p) {
+      return nonblank(p.get('name','')) ? p.name
+        : nonblank(request.auth.token.get('name','')) ? request.auth.token.name : request.auth.token.get('email','');
+    }
+    function owner() { return staff() && actorRole()=='OWNER'; }
+    function bounded() { return request.query.limit != null && request.query.limit <= 100; }
+    function pendingRequest(d,uid) {
+      return googleUser() && request.auth.uid==uid
+        && d.keys().toSet()==['uid','name','email','status','requestedAt'].toSet()
+        && d.uid==request.auth.uid && d.email==authEmail()
+        && nonblank(d.name) && d.name.size()<=160
+        && d.status=='pending' && d.requestedAt==request.time;
+    }
+
+    function adminSnapshot(p,uid) {
+      return {'uid':uid,'name':p.get('name',''),'email':p.get('email',''),'role':p.get('role','ADMIN'),
+        'status':p.get('status',p.get('active',false)==true ? 'approved':'inactive'),
+        'active':p.get('active',p.get('status','')=='approved')==true};
+    }
+    function targetOwnerGrant(p) {
+      let email=p.get('email','');
+      return email is string && email.size()>3 && !email.matches('.*[/].*')
+        && exists(/databases/$(database)/documents/accessGrants/$(email.lower()))
+        && get(/databases/$(database)/documents/accessGrants/$(email.lower())).data.get('role','ADMIN')=='OWNER';
+    }
+    function adminRemovalTransition(uid,old,next) {
+      return request.auth.uid!=uid && old.get('role','ADMIN')=='ADMIN'
+        && old.get('uid',uid)==uid && old.get('status','') is string
+        && old.get('email','') is string && old.get('email','').lower()!=authEmail()
+        && old.get('status','')!='revoked' && !targetOwnerGrant(old)
+        && next.diff(old).affectedKeys().hasOnly(['status','active','removedBy','removedAt','updatedAt','removalRequestId'])
+        && next.status=='revoked' && next.active==false && next.removedBy==request.auth.uid
+        && next.removedAt==request.time && next.updatedAt==request.time && uuid(next.removalRequestId);
+    }
+    function adminRemovalActivity(d,id,uid,old,next,actor) {
+      let before=adminSnapshot(old,uid);
+      let after=adminSnapshot(next,uid);
+      return d.keys().toSet()==['actorUid','actorName','actorEmail','actorRole','action','entityType','entityId','before','after','changedFields','timestamp','requestId','device','installationId','deviceName','brand','model','androidVersion','appVersion'].toSet()
+        && id==request.auth.uid+'_'+d.requestId && uuid(d.requestId) && d.requestId==next.removalRequestId
+        && d.actorUid==request.auth.uid && d.actorEmail==request.auth.token.get('email','')
+        && d.actorName==actorName(actor) && d.actorRole=='OWNER'
+        && d.action=='removeAdmin' && d.entityType=='user' && d.entityId==uid
+        && d.before==before && d.after==after
+        && d.changedFields=={'status':{'before':before.status,'after':'revoked'},'active':{'before':before.active,'after':false}}
+        && d.timestamp==request.time && device(d.device)
+        && d.diff(d.device).affectedKeys().hasOnly(['actorUid','actorName','actorEmail','actorRole','action','entityType','entityId','before','after','changedFields','timestamp','requestId','device']);
+    }
+    function authorizedAdminRemoval(uid,old,next) {
+      let actor=access();
+      let path=activityPath(request.auth.uid,next.removalRequestId);
+      return actor.allowed && actor.profile.get('role','ADMIN')=='OWNER'
+        && adminRemovalTransition(uid,old,next) && !exists(path)
+        && adminRemovalActivity(getAfter(path).data,request.auth.uid+'_'+next.removalRequestId,uid,old,next,actor.profile);
+    }
+    function authorizedAdminRemovalActivity(d,id) {
+      let actor=access();
+      let path=/databases/$(database)/documents/users/$(d.entityId);
+      return actor.allowed && actor.profile.get('role','ADMIN')=='OWNER' && exists(path)
+        && adminRemovalTransition(d.entityId,get(path).data,getAfter(path).data)
+        && adminRemovalActivity(d,id,d.entityId,get(path).data,getAfter(path).data,actor.profile);
+    }
+
+    function uuid(v) { return v is string && v.matches('[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'); }
+    function fileId(v) { return v is string && v.matches('[A-Za-z0-9_-]{10,200}'); }
+    function hash(v) { return v is string && v.matches('[0-9a-f]{64}'); }
+    function text(v,n) { return v is string && v.size()<=n; }
+    function mime(v) { return v in ['image/png','image/jpeg','image/webp']; }
+    function kind(v) { return v in ['product','partner','portfolioResidential','portfolioCorporate']; }
+    function portfolioType(category) { return category=='residential' ? 'portfolioResidential' : 'portfolioCorporate'; }
+    function nativeStaff() {
+      return staff() && request.auth.token.get('auth_time',0) is int && request.auth.token.auth_time>0;
+    }
+    // Every catalogue write requires a new activity and its new operation receipt
+    // in the same batch. The receipt checks complete live staff approval.
+    function catalogActor() { return request.auth!=null && request.auth.token.get('auth_time',0) is int && request.auth.token.auth_time>0; }
+    function entityPath(t,id) { return t=='product' ? /databases/$(database)/documents/products/$(id) : t=='partner' ? /databases/$(database)/documents/partners/$(id) : /databases/$(database)/documents/portfolioImages/$(id); }
+    function publicPath(t,id) { return t=='product' ? /databases/$(database)/documents/publicProducts/$(id) : t=='partner' ? /databases/$(database)/documents/publicPartners/$(id) : /databases/$(database)/documents/publicPortfolioImages/$(id); }
+    function assetPath(id) { return /databases/$(database)/documents/mediaAssets/$(id); }
+    function activityPath(uid,id) { return /databases/$(database)/documents/activityLogs/$(uid+'_'+id); }
+    function receiptPath(uid,id) { return /databases/$(database)/documents/operationReceipts/$(uid+'_'+id); }
+    function slotPath(uid,id) { return /databases/$(database)/documents/driveUploadRequests/$(uid+'_'+id); }
+    function auditPath(id) { return /databases/$(database)/documents/audit_logs/$(id); }
+    function ownRequest(id) { return id.matches(request.auth.uid+'_[0-9a-f-]{36}'); }
+    function folder(t) { return t=='product' ? '1RN6CPWKQ2i7rpgvxE3EUG0ndyuEm3NUd' : t=='partner' ? '1fEw1ct_IRe9LB0u5n24gzBEOVQ2ekom6' : t=='portfolioResidential' ? '1kOqO3wgNmUCujrhb1tqY3kB_kG7jTEjx' : '10Z9US8nxqTV5AkJrRrEURRsWNhOpvHvK'; }
+    function device(d) {
+      return d is map && d.keys().toSet()==['installationId','deviceName','brand','model','androidVersion','appVersion'].toSet()
+        && uuid(d.installationId) && text(d.deviceName,100) && d.deviceName.size()>0 && text(d.brand,80)
+        && text(d.model,100) && text(d.androidVersion,40) && text(d.appVersion,40);
+    }
+    function specs(m) {
+      let keys=m.keys();
+      let values=m.values();
+      let k=keys.join('\u001f');
+      let v=values.join('\u001f');
+      // join() coerces values, so compare split output with the original list:
+      // every original value must itself be a string, not merely stringify as one.
+      return m is map && m.size()<=50 && (m.size()==0
+        || k.split('\u001f')==keys && v.split('\u001f')==values
+          && k.matches('[^\u001f]{1,80}(\u001f[^\u001f]{1,80})*')
+          && v.matches('[^\u001f]{0,1000}(\u001f[^\u001f]{0,1000})*'));
+    }
+    function references(e,t,p) { return t=='product' ? ((e.images.size()>0 && e.images[0].storagePath==p) || (e.images.size()>1 && e.images[1].storagePath==p) || (e.images.size()>2 && e.images[2].storagePath==p) || (e.images.size()>3 && e.images[3].storagePath==p) || (e.images.size()>4 && e.images[4].storagePath==p) || (e.images.size()>5 && e.images[5].storagePath==p) || (e.images.size()>6 && e.images[6].storagePath==p) || (e.images.size()>7 && e.images[7].storagePath==p)) : t=='partner' ? e.logo.storagePath==p : e.image!=null && e.image.storagePath==p; }
+    function previousImage(old,t,m) { return old!=null && (t=='product' ? old.images.hasAny([m]) : t=='partner' ? old.logo==m : old.image==m); }
+    function media(a) { return {'storagePath':'drive/'+a.id,'url':'','provider':'drive','driveFileId':a.driveFileId,'fileName':a.fileName,'mimeType':a.mimeType,'sizeBytes':a.sizeBytes}; }
+    function managedImage(m,t,id,old) {
+      let a=getAfter(assetPath(m.storagePath.split('/')[1])).data;
+      return a.entityType==t && a.entityId==id && m==media(a)
+        && (a.status=='attached' || a.status=='uploaded' && (a.createdBy==request.auth.uid || previousImage(old,t,m)));
+    }
+    function validImage(m,t,id,old) {
+      return m is map && m.storagePath is string && (m.storagePath.matches('drive/[0-9a-f-]{36}')
+        ? managedImage(m,t,id,old)
+        : previousImage(old,t,m));
+    }
+    function imageAt(images,i,t,id,old) { return images.size()<=i || validImage(images[i],t,id,old); }
+    function metadata(d,id,old) {
+      return d.id==id && uuid(id) && uuid(d.lastRequestId) && d.archived is bool && d.version is int
+        && d.updatedBy==request.auth.uid && d.updatedAt==request.time && d.createdAt is timestamp && text(d.createdBy,128)
+        && (old==null ? d.version==1 && !d.archived && d.createdBy==request.auth.uid && d.createdAt==request.time
+          : !old.archived && d.version==old.version+1 && d.createdBy==old.createdBy && d.createdAt==old.createdAt
+            && (!d.archived || d.diff(old).affectedKeys().hasOnly(['archived','image','version','updatedAt','updatedBy','lastRequestId'])));
+    }
+    function product(d,id,old) {
+      let images=d.images;
+      return d.keys().toSet()==['id','name','brand','model','category','capacityPk','condition','price','description','specifications','images','mainImagePath','status','archived','version','createdAt','createdBy','updatedAt','updatedBy','lastRequestId','searchTokens'].toSet()
+        && metadata(d,id,old) && d.images is list && d.images.size()<=8 && d.images.toSet().size()==d.images.size()
+        && d.status in ['draft','active','inactive'] && (d.status!='active' || d.images.size()>0)
+        && text(d.mainImagePath,500) && (d.images.size()==0 ? d.mainImagePath=='' : references(d,'product',d.mainImagePath))
+        // The mandatory fresh receipt validates image slots four through seven.
+        && imageAt(images,0,'product',id,old) && imageAt(images,1,'product',id,old) && imageAt(images,2,'product',id,old) && imageAt(images,3,'product',id,old);
+    }
+    function productContent(d) {
+      return text(d.name,160) && d.name.size()>=2 && text(d.brand,100) && d.brand.size()>0
+        && text(d.model,100) && d.category in ['split','cassette','standing','ducted','central','other']
+        && text(d.capacityPk,40) && d.condition in ['new','used'] && (d.price==null || d.price is number && d.price>=0 && d.price<=1000000000000)
+        && text(d.description,10000) && specs(d.specifications) && d.searchTokens is list && d.searchTokens.size()<=1000;
+    }
+    function partner(d,id,old) {
+      return d.keys().toSet()==['id','name','logo','altText','website','displayOrder','active','archived','version','createdAt','createdBy','updatedAt','updatedBy','lastRequestId'].toSet()
+        && metadata(d,id,old) && text(d.name,160) && d.name.size()>=2 && validImage(d.logo,'partner',id,old)
+        && text(d.altText,250) && d.altText.size()>0 && text(d.website,2048)
+        && (d.website=='' || d.website.matches('https://[A-Za-z0-9.-]+(:[0-9]{1,5})?([/?#][^ \\n\\r<>]*)?'))
+        && d.displayOrder is int && d.displayOrder>=0 && d.displayOrder<=1000000 && d.active is bool;
+    }
+    function snapshot(e,t) {
+      return t=='product' ? {'id':e.id,'name':e.name,'brand':e.brand,'model':e.model,'category':e.category,'capacityPk':e.capacityPk,'condition':e.condition,'price':e.price,'description':e.description,'specifications':e.specifications,'images':e.images,'mainImagePath':e.mainImagePath,'status':e.status,'archived':e.archived,'version':e.version}
+        : t=='partner' ? {'id':e.id,'name':e.name,'logo':e.logo,'altText':e.altText,'website':e.website,'displayOrder':e.displayOrder,'active':e.active,'archived':e.archived,'version':e.version}
+        : {'id':e.id,'category':e.category,'image':e.image,'archived':e.archived,'version':e.version};
+    }
+    function portfolio(d,id,old) {
+      return d.keys().toSet()==['id','category','image','archived','version','createdAt','createdBy','updatedAt','updatedBy','lastRequestId'].toSet()
+        && metadata(d,id,old) && d.category in ['residential','corporate'] && (old==null || d.category==old.category)
+        && (d.archived ? d.image==null : d.image is map && d.image.storagePath.matches('drive/[0-9a-f-]{36}') && validImage(d.image,portfolioType(d.category),id,old));
+    }
+    function published(e,t) { return !e.archived && (t=='product' ? e.status=='active' : t=='partner' ? e.active : true); }
+    function productProjection(p,e) {
+      return p.keys().toSet()==['id','name','brand','model','category','capacityPk','condition','price','description','specifications','images','mainImagePath','status','archived','createdAt','updatedAt','mediaPaths'].toSet()
+        && p.diff(e).affectedKeys().hasOnly(['version','createdBy','updatedBy','lastRequestId','searchTokens','mediaPaths'])
+        && p.mediaPaths is list && p.mediaPaths.size()==e.images.size()
+        && (e.images.size()<=0 || p.mediaPaths[0]==e.images[0].storagePath) && (e.images.size()<=1 || p.mediaPaths[1]==e.images[1].storagePath) && (e.images.size()<=2 || p.mediaPaths[2]==e.images[2].storagePath) && (e.images.size()<=3 || p.mediaPaths[3]==e.images[3].storagePath) && (e.images.size()<=4 || p.mediaPaths[4]==e.images[4].storagePath) && (e.images.size()<=5 || p.mediaPaths[5]==e.images[5].storagePath) && (e.images.size()<=6 || p.mediaPaths[6]==e.images[6].storagePath) && (e.images.size()<=7 || p.mediaPaths[7]==e.images[7].storagePath);
+    }
+    function projection(p,e,t) {
+      return t=='product' ? productProjection(p,e)
+        : t=='partner' ? p.keys().toSet()==['id','name','logo','altText','website','displayOrder','active','archived','createdAt','updatedAt','mediaPaths'].toSet()
+          && p.diff(e).affectedKeys().hasOnly(['version','createdBy','updatedBy','lastRequestId','mediaPaths']) && p.mediaPaths==[e.logo.storagePath]
+        : p.keys().toSet()==['id','category','image','archived','createdAt','updatedAt','mediaPaths'].toSet()
+          && p.diff(e).affectedKeys().hasOnly(['version','createdBy','updatedBy','lastRequestId','mediaPaths']) && p.mediaPaths==[e.image.storagePath];
+    }
+    function action(e,old,t) { return old==null ? 'add' : e.archived ? 'archive' : (t=='product' ? e.status!=old.status : t=='partner' ? e.active!=old.active : false) ? 'status' : 'edit'; }
+    function operation(e,t) { return t=='product' ? (e.archived ? 'archiveProduct':'saveProduct') : t=='partner' ? (e.archived ? 'archivePartner':'savePartner') : (e.archived ? 'archivePortfolio':'savePortfolio'); }
+    function linkedActivity(d,t,id) {
+      let log=getAfter(activityPath(request.auth.uid,d.lastRequestId)).data;
+      // A fresh log must be written in this batch. It requires a fresh authorized
+      // receipt, public projection, actor identity and the content schema.
+      return !exists(activityPath(request.auth.uid,d.lastRequestId)) && log.timestamp==request.time && log.requestId==d.lastRequestId && log.actorUid==request.auth.uid && log.entityId==id && log.entityType==t && log.after==snapshot(d,t);
+    }
+    function changeField(d,k) { return !(k in d.changedFields) || d.changedFields[k]=={'before':d.before.get(k,null),'after':d.after.get(k,null)}; }
+    function changes(d,t) {
+      // Full before/after snapshots below remain authoritative. ChangedFields is
+      // a display index and cannot add keys outside those exact snapshots.
+      return d.changedFields is map && d.changedFields.keys().hasOnly(t=='product'
+        ? ['id','name','brand','model','category','capacityPk','condition','price','description','specifications','images','mainImagePath','status','archived','version']
+        : t=='partner' ? ['id','name','logo','altText','website','displayOrder','active','archived','version'] : ['id','category','image','archived','version']);
+    }
+    function authorizedActivity(d,id) {
+      // validActivity requires a brand-new receipt. Its nativeStaff rule is the
+      // approval gate, so this operation can spend its budget on exact snapshots.
+      return catalogActor() && validActivity(d,id,profile());
+    }
+    function validActivity(d,id,actor) {
+      let t=d.entityType;
+      let e=getAfter(entityPath(t,d.entityId)).data;
+      let old=exists(entityPath(t,d.entityId)) ? get(entityPath(t,d.entityId)).data : null;
+      let r=getAfter(receiptPath(request.auth.uid,d.requestId)).data;
+      return kind(t) && uuid(d.entityId) && uuid(d.requestId) && id==request.auth.uid+'_'+d.requestId
+        && d.keys().toSet()==['actorUid','actorName','actorEmail','actorRole','action','entityType','entityId','before','after','changedFields','timestamp','requestId','device','installationId','deviceName','brand','model','androidVersion','appVersion'].toSet()
+        && d.actorUid==request.auth.uid && d.actorEmail==request.auth.token.get('email','') && d.actorName==actorName(actor) && d.actorRole==actor.get('role','ADMIN')
+        && d.timestamp==request.time && device(d.device)
+        && d.diff(d.device).affectedKeys().hasOnly(['actorUid','actorName','actorEmail','actorRole','action','entityType','entityId','before','after','changedFields','timestamp','requestId','device'])
+        && e.lastRequestId==d.requestId && e.updatedBy==request.auth.uid && e.updatedAt==request.time
+        && changes(d,t) && d.action==action(e,old,t) && (t!='product' || productContent(e))
+        && !exists(receiptPath(request.auth.uid,d.requestId)) && r.entityType==t && r.entityId==d.entityId && r.result=={'id':e.id,'version':e.version} && r.createdAt==request.time && r.operation==operation(e,t)
+        && (published(e,t) ? freshProjection(t,d.entityId) : !existsAfter(publicPath(t,d.entityId)));
+    }
+    function freshProjection(t,id) {
+      let path=publicPath(t,id);
+      let next=getAfter(path).data;
+      return next.updatedAt==request.time && (!exists(path) || get(path).data.updatedAt!=request.time);
+    }
+    function validReceipt(d,id) {
+      let e=getAfter(entityPath(d.entityType,d.entityId)).data;
+      let old=exists(entityPath(d.entityType,d.entityId)) ? get(entityPath(d.entityType,d.entityId)).data : null;
+      let log=getAfter(activityPath(request.auth.uid,e.lastRequestId)).data;
+      return d.keys().toSet()==['hash','result','entityType','entityId','operation','createdAt'].toSet()
+        && hash(d.hash) && kind(d.entityType) && uuid(d.entityId) && d.createdAt==request.time && id==request.auth.uid+'_'+e.lastRequestId
+        && e.updatedBy==request.auth.uid && e.updatedAt==request.time && d.result=={'id':e.id,'version':e.version} && d.operation==operation(e,d.entityType)
+        // Split validation across mandatory atomic writes to keep eight-image
+        // replacements within the evaluator budget. Both snapshots stay exact.
+        && log.before==(old==null ? {} : snapshot(old,d.entityType))
+        && (d.entityType!='product' || imageAt(e.images,4,'product',e.id,old) && imageAt(e.images,5,'product',e.id,old) && imageAt(e.images,6,'product',e.id,old) && imageAt(e.images,7,'product',e.id,old));
+    }
+    function validReservation(d,id) {
+      let slot=getAfter(slotPath(request.auth.uid,d.requestId)).data;
+      return d.keys().toSet()==['id','driveFileId','folder','entityType','entityId','createdBy','device','requestId','status','expectedBytes','expectedMime','originalSha256','originalFileName','createdAt','expiresAt','source'].toSet()
+        && uuid(id) && d.id==id && fileId(d.driveFileId) && kind(d.entityType) && uuid(d.entityId) && d.folder==folder(d.entityType)
+        && d.source=='android' && d.createdBy==request.auth.uid && device(d.device) && uuid(d.requestId) && d.status=='reserved'
+        && d.expectedBytes is int && d.expectedBytes>0 && d.expectedBytes<=5242880 && mime(d.expectedMime) && hash(d.originalSha256)
+        && text(d.originalFileName,120) && d.createdAt==request.time && d.expiresAt is timestamp && d.expiresAt>request.time && d.expiresAt<=request.time+duration.value(25,'h')
+        && slot.assetId==id && slot.createdBy==request.auth.uid && slot.source=='android' && slot.createdAt==request.time;
+    }
+    function validSlot(d,id) {
+      let a=getAfter(assetPath(d.assetId)).data;
+      return d.keys().toSet()==['hash','assetId','createdAt','createdBy','source'].toSet()
+        && hash(d.hash) && uuid(d.assetId) && d.createdAt==request.time && d.createdBy==request.auth.uid && d.source=='android'
+        && id==request.auth.uid+'_'+a.requestId && a.status=='reserved' && a.createdBy==request.auth.uid && a.createdAt==request.time;
+    }
+    function upload(a,old) {
+      let audit=getAfter(auditPath('upload_'+a.id)).data;
+      return old.status=='reserved' && old.source=='android' && old.createdBy==request.auth.uid && old.expiresAt>request.time
+        && a.diff(old).affectedKeys().hasOnly(['status','fileName','mimeType','sizeBytes','sha256','uploadedAt'])
+        && a.status=='uploaded' && a.uploadedAt==request.time && a.mimeType==old.expectedMime && a.sizeBytes==old.expectedBytes && a.sha256==old.originalSha256
+        && text(a.fileName,160) && a.fileName.size()>0 && audit.timestamp==request.time && audit.mediaId==a.id && audit.userId==request.auth.uid;
+    }
+    function attach(a,old) {
+      let e=getAfter(entityPath(a.entityType,a.entityId)).data;
+      let log=get(activityPath(request.auth.uid,a.lastRequestId)).data;
+      return old.status=='uploaded' && old.createdBy==request.auth.uid && a.diff(old).affectedKeys().hasOnly(['status','attachedAt','lastRequestId'])
+        && a.status=='attached' && a.attachedAt==request.time && uuid(a.lastRequestId)
+        && log.actorUid==request.auth.uid && log.entityId==a.entityId && log.entityType==a.entityType
+        && references(log.after,a.entityType,'drive/'+a.id) && references(e,a.entityType,'drive/'+a.id);
+    }
+    function detach(a,old) {
+      let e=getAfter(entityPath(a.entityType,a.entityId)).data;
+      let log=get(activityPath(request.auth.uid,a.lastRequestId)).data;
+      let audit=getAfter(auditPath(request.auth.uid+'_'+a.lastRequestId+'_remove_'+a.id)).data;
+      return old.status in ['uploaded','attached'] && a.diff(old).affectedKeys().hasOnly(['status','detachedAt','deleteAfter','lastRequestId'])
+        && a.status=='detached' && a.detachedAt==request.time && uuid(a.lastRequestId) && a.deleteAfter is timestamp && a.deleteAfter>request.time && a.deleteAfter<=request.time+duration.value(25,'h')
+        && !references(e,a.entityType,'drive/'+a.id) && log.actorUid==request.auth.uid && log.entityType==a.entityType && log.entityId==a.entityId
+        && references(log.before,a.entityType,'drive/'+a.id) && !references(log.after,a.entityType,'drive/'+a.id)
+        && audit.timestamp==request.time && audit.userId==request.auth.uid && audit.mediaId==a.id;
+    }
+    function unreferenced(a) { return !existsAfter(entityPath(a.entityType,a.entityId)) || !references(getAfter(entityPath(a.entityType,a.entityId)).data,a.entityType,'drive/'+a.id); }
+    function beginDelete(a,old) {
+      return old.status in ['uploaded','detached'] && (old.createdBy==request.auth.uid || actorRole()=='OWNER')
+        && a.diff(old).affectedKeys().hasOnly(['status','deleteRequestId','deleteDevice','deleteActorUid','deleteStartedAt'])
+        && a.status=='deleting' && uuid(a.deleteRequestId) && device(a.deleteDevice) && a.deleteActorUid==request.auth.uid && a.deleteStartedAt==request.time && unreferenced(a);
+    }
+    function finishDelete(a,old) {
+      let audit=getAfter(auditPath('delete_'+a.id)).data;
+      return old.status=='deleting' && old.deleteActorUid==request.auth.uid && a.diff(old).affectedKeys().hasOnly(['status','deletedAt'])
+        && a.status=='deleted' && a.deletedAt==request.time && unreferenced(a) && audit.timestamp==request.time && audit.mediaId==a.id && audit.userId==request.auth.uid && audit.requestId==old.deleteRequestId;
+    }
+    function authorizedMediaAudit(d,id) {
+      let decision=access();
+      return decision.allowed && request.auth.token.get('auth_time',0) is int && request.auth.token.auth_time>0 && mediaAudit(d,id,decision.profile);
+    }
+    function mediaAudit(d,id,actor) {
+      let a=getAfter(assetPath(d.mediaId)).data;
+      let old=get(assetPath(d.mediaId)).data;
+      return d.keys().toSet()==['userId','userEmail','actorName','actorRole','action','targetId','entityType','driveFileId','mediaId','deviceId','device','status','timestamp','requestId'].toSet()
+        && d.userId==request.auth.uid && d.userEmail==request.auth.token.get('email','') && d.actorName==actorName(actor) && d.actorRole==actor.get('role','ADMIN')
+        && d.status=='SUCCESS' && d.timestamp==request.time && uuid(d.requestId) && uuid(d.mediaId) && d.targetId==a.entityId && d.entityType==a.entityType && d.driveFileId==a.driveFileId
+        && device(d.device) && d.deviceId==d.device.installationId
+        && (id=='upload_'+a.id ? old.status=='reserved' && a.status=='uploaded' && a.uploadedAt==request.time && a.createdBy==request.auth.uid && d.requestId==a.requestId && d.device==a.device
+            && d.action==(a.entityType=='product' ? 'UPLOAD_PRODUCT_IMAGE':a.entityType=='partner' ? 'UPLOAD_PARTNER_LOGO':'UPLOAD_PORTFOLIO_IMAGE')
+          : id=='delete_'+a.id ? old.status=='deleting' && a.status=='deleted' && a.deletedAt==request.time && a.deleteActorUid==request.auth.uid && d.requestId==a.deleteRequestId && d.device==a.deleteDevice
+            && d.action==(a.entityType=='product' ? 'DELETE_PRODUCT_IMAGE':a.entityType=='partner' ? 'DELETE_PARTNER_LOGO':'DELETE_PORTFOLIO_IMAGE')
+          : id==request.auth.uid+'_'+a.lastRequestId+'_remove_'+a.id && old.status in ['uploaded','attached'] && a.status=='detached' && a.detachedAt==request.time && d.requestId==a.lastRequestId
+            && removalAudit(d,a,get(activityPath(request.auth.uid,a.lastRequestId)).data));
+    }
+    function removalAudit(d,a,log) {
+      let replacing=a.entityType=='product' ? !log.after.images.hasOnly(log.before.images) : a.entityType=='partner' ? log.after.logo!=log.before.logo : log.after.image!=null && log.after.image!=log.before.image;
+      return d.device==log.device && d.action==(a.entityType=='product' ? (replacing ? 'REPLACE_PRODUCT_IMAGE':'REMOVE_PRODUCT_IMAGE') : a.entityType=='partner' ? (replacing ? 'REPLACE_PARTNER_LOGO':'REMOVE_PARTNER_LOGO') : (replacing ? 'REPLACE_PORTFOLIO_IMAGE':'REMOVE_PORTFOLIO_IMAGE'));
+    }
+
+    match /publicProducts/{id} {
+      allow get: if resource.data.status == 'active' && resource.data.archived == false;
+      allow list: if bounded() && resource.data.status == 'active' && resource.data.archived == false;
+      allow create, update: if nativeStaff() && published(getAfter(entityPath('product',id)).data,'product') && projection(request.resource.data,getAfter(entityPath('product',id)).data,'product');
+      allow delete: if nativeStaff() && !published(getAfter(entityPath('product',id)).data,'product');
+    }
+    match /publicPartners/{id} {
+      allow get: if resource.data.active == true && resource.data.archived == false;
+      allow list: if bounded() && resource.data.active == true && resource.data.archived == false;
+      allow create, update: if nativeStaff() && published(getAfter(entityPath('partner',id)).data,'partner') && projection(request.resource.data,getAfter(entityPath('partner',id)).data,'partner');
+      allow delete: if nativeStaff() && !published(getAfter(entityPath('partner',id)).data,'partner');
+    }
+    match /publicPortfolioImages/{id} {
+      allow get: if resource.data.archived == false;
+      allow list: if bounded() && resource.data.archived == false;
+      allow create, update: if nativeStaff()
+        && !getAfter(/databases/$(database)/documents/portfolioImages/$(id)).data.archived
+        && projection(request.resource.data,getAfter(/databases/$(database)/documents/portfolioImages/$(id)).data,'portfolioResidential');
+      allow delete: if nativeStaff() && getAfter(/databases/$(database)/documents/portfolioImages/$(id)).data.archived;
+    }
+    match /products/{id} {
+      allow get: if staff();
+      allow list: if staff() && bounded();
+      // The mandatory activity and fresh receipt enforce live staff approval;
+      // avoid repeating it here to preserve the eight-image evaluator budget.
+      allow create, update: if catalogActor() && product(request.resource.data,id,resource==null ? null : resource.data) && linkedActivity(request.resource.data,'product',id);
+    }
+    match /partners/{id} {
+      allow get: if staff();
+      allow list: if staff() && bounded();
+      allow create, update: if catalogActor() && partner(request.resource.data,id,resource==null ? null : resource.data) && linkedActivity(request.resource.data,'partner',id);
+    }
+    match /portfolioImages/{id} {
+      allow get: if staff();
+      allow list: if staff() && bounded();
+      allow create, update: if catalogActor()
+        && portfolio(request.resource.data,id,resource==null ? null : resource.data)
+        && linkedActivity(request.resource.data,portfolioType(request.resource.data.category),id);
+    }
+    match /users/{uid} {
+      // Pending accounts must observe their own developer-managed decision,
+      // including a missing profile. Initial pending creation requires the same
+      // new request in this batch. Approval remains developer-managed; an
+      // OWNER can only revoke an ADMIN through an audited one-way transition.
+      allow get: if request.auth!=null && (request.auth.uid==uid || owner());
+      allow list: if owner() && bounded();
+      allow create: if pendingRequest(request.resource.data,uid)
+        && !exists(/databases/$(database)/documents/accessRequests/$(uid))
+        && getAfter(/databases/$(database)/documents/accessRequests/$(uid)).data==request.resource.data;
+      allow update: if authorizedAdminRemoval(uid,resource.data,request.resource.data);
+    }
+    match /accessGrants/{email} {
+      allow get: if (googleUser() && email==authEmail()) || owner();
+    }
+    match /accessRequests/{uid} {
+      allow get: if request.auth!=null && request.auth.uid==uid;
+      allow create: if pendingRequest(request.resource.data,uid)
+        && uidProfile().get('active',true)!=false
+        && !(uidProfile().get('status','') in ['rejected','denied','revoked','inactive','disabled']);
+    }
+    match /activityLogs/{id} {
+      allow get: if owner() || (staff() && resource.data.actorUid == request.auth.uid);
+      allow list: if bounded() && (owner() || (staff() && resource.data.actorUid == request.auth.uid));
+      allow create: if request.resource.data.get('entityType','')=='user'
+        ? authorizedAdminRemovalActivity(request.resource.data,id) : authorizedActivity(request.resource.data,id);
+    }
+    match /audit_logs/{id} {
+      allow get: if owner() || (staff() && resource.data.userId == request.auth.uid);
+      allow list: if bounded() && (owner() || (staff() && resource.data.userId == request.auth.uid));
+      allow create: if authorizedMediaAudit(request.resource.data,id);
+    }
+    match /operationReceipts/{id} {
+      allow get: if staff() && (owner() || ownRequest(id));
+      allow create: if nativeStaff() && validReceipt(request.resource.data,id);
+    }
+    match /driveUploadRequests/{id} {
+      allow get: if staff() && (owner() || ownRequest(id));
+      allow create: if nativeStaff() && validSlot(request.resource.data,id);
+    }
+    match /mediaAssets/{id} {
+      allow get: if staff();
+      allow list: if staff() && bounded();
+      allow create: if nativeStaff() && validReservation(request.resource.data,id);
+      allow update: if nativeStaff() && (request.resource.data.status=='uploaded' ? upload(request.resource.data,resource.data)
+        : request.resource.data.status=='attached' ? attach(request.resource.data,resource.data)
+        : request.resource.data.status=='detached' ? detach(request.resource.data,resource.data)
+        : request.resource.data.status=='deleting' ? beginDelete(request.resource.data,resource.data)
+        : request.resource.data.status=='deleted' && finishDelete(request.resource.data,resource.data));
+    }
+    // Native logs prove Firebase actor/time and atomic document transitions.
+    // Rules cannot independently verify a Google Drive request or device identity.
+    // Credentials, approval/role writes, log rewrites and all unlisted data stay denied.
+    match /{document=**} { allow read, write: if false; }
+  }
+}
